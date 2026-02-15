@@ -18,19 +18,44 @@ LANGUAGE_CONFIG = {
         "male_voice": "hi-IN-MadhurNeural",
         "female_voice": "hi-IN-SwaraNeural",
     },
-    "Telugu": {
-        "code": "te",
-        "male_voice": "te-IN-MohanNeural",
-        "female_voice": "te-IN-ShrutiNeural",
+    "Bengali": {
+        "code": "bn",
+        "male_voice": "bn-IN-BashkarNeural",
+        "female_voice": "bn-IN-TanishaaNeural",
+    },
+    "Gujarati": {
+        "code": "gu",
+        "male_voice": "gu-IN-NiranjanNeural",
+        "female_voice": "gu-IN-DhwaniNeural",
+    },
+    "Kannada": {
+        "code": "kn",
+        "male_voice": "kn-IN-GaganNeural",
+        "female_voice": "kn-IN-SapnaNeural",
+    },
+    "Malayalam": {
+        "code": "ml",
+        "male_voice": "ml-IN-MidhunNeural",
+        "female_voice": "ml-IN-SobhanaNeural",
+    },
+    "Marathi": {
+        "code": "mr",
+        "male_voice": "mr-IN-ManoharNeural",
+        "female_voice": "mr-IN-AarohiNeural",
     },
     "Tamil": {
         "code": "ta",
         "male_voice": "ta-IN-ValluvarNeural",
         "female_voice": "ta-IN-PallaviNeural",
     },
-    "Malayalam": {
-        "code": "ml",
-        "male_voice": "ml-IN-MidhunNeural",
-        "female_voice": "ml-IN-SobhanaNeural",
+    "Telugu": {
+        "code": "te",
+        "male_voice": "te-IN-MohanNeural",
+        "female_voice": "te-IN-ShrutiNeural",
+    },
+    "Urdu": {
+        "code": "ur",
+        "male_voice": "ur-IN-SalmanNeural",
+        "female_voice": "ur-IN-GulNeural",
     },
 }

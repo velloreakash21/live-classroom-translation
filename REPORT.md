@@ -37,9 +37,14 @@ Browser Mic → WebRTC (stereo s16 48kHz)
 | Language   | Male Voice              | Female Voice            |
 |------------|-------------------------|-------------------------|
 | Hindi      | hi-IN-MadhurNeural      | hi-IN-SwaraNeural       |
-| Telugu     | te-IN-MohanNeural       | te-IN-ShrutiNeural      |
-| Tamil      | ta-IN-ValluvarNeural    | ta-IN-PallaviNeural     |
+| Bengali    | bn-IN-BashkarNeural     | bn-IN-TanishaaNeural    |
+| Gujarati   | gu-IN-NiranjanNeural    | gu-IN-DhwaniNeural      |
+| Kannada    | kn-IN-GaganNeural       | kn-IN-SapnaNeural       |
 | Malayalam  | ml-IN-MidhunNeural      | ml-IN-SobhanaNeural     |
+| Marathi    | mr-IN-ManoharNeural     | mr-IN-AarohiNeural      |
+| Tamil      | ta-IN-ValluvarNeural    | ta-IN-PallaviNeural     |
+| Telugu     | te-IN-MohanNeural       | te-IN-ShrutiNeural      |
+| Urdu       | ur-IN-SalmanNeural      | ur-IN-GulNeural         |
 
 ## Measured Latency
 
