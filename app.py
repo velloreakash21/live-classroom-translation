@@ -9,6 +9,16 @@ from dotenv import load_dotenv
 from config import LANGUAGE_CONFIG
 from audio_processor import TranslationProcessor
 
+# Monkey-patch streamlit-webrtc shutdown bug (0.64.5 + Python 3.13)
+# _polling_thread can be None when stop() is called during Streamlit reruns
+import streamlit_webrtc.shutdown as _sw
+_orig_stop = _sw.SessionShutdownObserver.stop
+def _patched_stop(self):
+    if getattr(self, "_polling_thread", None) is None:
+        return
+    _orig_stop(self)
+_sw.SessionShutdownObserver.stop = _patched_stop
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
