@@ -103,6 +103,122 @@ Assumptions:
 
 > A full classroom day (8 hours) of continuous live translation costs under $1.
 
+## Latency Optimization Roadmap
+
+### Current Bottleneck Breakdown
+
+```
+Buffer wait:  ████████████████████████  3.00s  (60%)
+STT:          ███                       0.45s  (9%)
+Translation:  ██                        0.30s  (6%)
+TTS:          ███████                   1.10s  (22%)
+Overhead:     █                         0.15s  (3%)
+              ─────────────────────────────────
+Total:                                  ~5.00s
+```
+
+The 3-second audio buffer is the single largest contributor to end-to-end latency. The current architecture is **batch-oriented** — it collects a fixed window of audio, then processes it sequentially. A streaming architecture can eliminate the buffer entirely and overlap pipeline stages.
+
+### Optimization 1: Streaming STT (eliminates 3s buffer)
+
+Replace the batch STT (buffer → Whisper API call) with a **streaming STT** service that receives audio continuously via WebSocket and returns partial transcripts in real-time.
+
+| Service | Latency (first word) | Cost | Notes |
+|---------|---------------------|------|-------|
+| **Deepgram Nova-2** | ~300ms | $0.0059/min | Best price-to-performance; English streaming; built-in VAD |
+| **Azure Speech Services** | ~200ms | $1.00/hr | Excellent Indian language support; WebSocket streaming |
+| **Google Cloud STT v2** | ~300ms | $0.024/min | Wide language support; streaming gRPC API |
+| **AssemblyAI Real-time** | ~300ms | $0.0065/min | Simple WebSocket API; English-focused |
+
+**Estimated impact:** 3.0s → ~0.3s buffer+STT (saves ~2.7s).
+
+**Recommended pick:** Deepgram Nova-2 — cheapest, fastest, built-in endpointing/VAD, simple WebSocket API.
+
+### Optimization 2: Streaming TTS (reduces ~1.1s to ~0.2s)
+
+edge-tts synthesizes the entire MP3 file before returning it. **Streaming TTS** services send audio chunks as they are generated, so playback can begin before synthesis completes.
+
+| Service | First-byte Latency | Quality | Cost | Indian Language Support |
+|---------|-------------------|---------|------|------------------------|
+| **Cartesia Sonic** | ~90ms | Very good | $0.042/1K chars | Limited |
+| **ElevenLabs Turbo v2.5** | ~300ms | Excellent | $0.30/1K chars | Hindi, Telugu, Tamil + more |
+| **Azure Neural TTS** (WebSocket) | ~200ms | Great | $16/1M chars (~$0.016/1K) | All 9 Indian languages |
+| **Deepgram Aura** | ~250ms | Good | $0.0150/1K chars | Limited |
+| **PlayHT** (streaming) | ~300ms | Great | $0.05/1K chars | Some Indian languages |
+| **edge-tts** (current) | ~1100ms | Good | **Free** | All 9 Indian languages |
+
+**Estimated impact:** 1.1s → ~0.2-0.3s (saves ~0.8s).
+
+**Recommended pick:** Azure Neural TTS via WebSocket — supports all 9 Indian languages already configured, sub-200ms first byte, affordable at ~$0.016 per 1K characters.
+
+### Optimization 3: Faster / Streaming Translation
+
+| Approach | Latency | Cost |
+|----------|---------|------|
+| **Groq Llama 3.3** (current, batch) | ~300ms | $0.59/$0.79 per 1M tokens |
+| **Groq Llama 3.3** (streaming tokens) | ~100ms first token | Same |
+| **Cerebras Inference** | ~50ms first token | Similar |
+| **Google Translate API** | ~100-200ms | $20/1M chars |
+| **DeepL API** | ~100-200ms | $25/1M chars |
+
+Streaming the LLM response allows the TTS stage to begin as soon as the first sentence boundary is detected, rather than waiting for the full translation.
+
+**Estimated impact:** 0.3s → ~0.1s (saves ~0.2s).
+
+### Projected Latency by Upgrade Tier
+
+| Configuration | Buffer | STT | Translate | TTS | Total E2E | Est. Cost/hr |
+|---------------|--------|-----|-----------|-----|-----------|-------------|
+| **Current (POC)** | 3.0s | 0.45s | 0.30s | 1.10s | **~5.0s** | $0.10 |
+| **Tier 1:** Streaming STT | 0s | 0.30s | 0.30s | 1.10s | **~1.7s** | $0.15 |
+| **Tier 2:** + Streaming TTS | 0s | 0.30s | 0.30s | 0.25s | **~0.85s** | $0.50 |
+| **Tier 3:** Full streaming pipeline | 0s | 0.20s | 0.10s | 0.20s | **~0.5s** | $1–2 |
+
+### Architecture Change: Batch → Streaming
+
+The current POC uses a batch architecture where each stage completes before the next begins:
+
+```
+Current (batch):
+  [====3s buffer====] → [STT] → [Translate] → [TTS] → [Play]
+                         0.45s    0.30s         1.10s
+```
+
+A streaming architecture overlaps all stages and eliminates the buffer:
+
+```
+Streaming (pipelined):
+  audio──→ STT words──→ translate sentence──→ TTS chunks──→ play
+  audio──→ STT words──→ translate sentence──→ TTS chunks──→ play
+  (continuous, overlapping — each stage feeds the next in real-time)
+```
+
+Key implementation changes required:
+1. **WebSocket connections** to STT and TTS services (persistent, not per-request)
+2. **Sentence boundary detection** between STT and translation to trigger translation at natural pause points
+3. **Async pipeline** replacing the current threading model — all stages run concurrently with async generators
+4. **Chunk-level TTS playback** — begin playing audio as soon as the first TTS chunk arrives, not after full synthesis
+
+### Recommended Upgrade Path
+
+**Phase 1 — Quick win (~1.7s, minimal code change):**
+- Replace Groq Whisper batch calls with **Deepgram Nova-2 streaming** WebSocket
+- Remove the 3s PCM buffer; let Deepgram handle endpointing/VAD
+- Keep Groq translation and edge-tts unchanged
+- Cost increase: ~$0.05/hr
+
+**Phase 2 — Sub-second (~0.85s, moderate rewrite):**
+- Add **Azure Neural TTS** via WebSocket (streaming playback)
+- Enable **Groq streaming** response for translation
+- Begin TTS synthesis as soon as first translated sentence is available
+- Cost increase: ~$0.40/hr
+
+**Phase 3 — Near real-time (~0.5s, full rewrite):**
+- All services connected via persistent WebSockets
+- **Deepgram** streaming STT + **Cerebras** streaming translation + **Cartesia Sonic** streaming TTS
+- Fully async pipeline with overlapping stages
+- Cost: ~$1–2/hr (still under $16/day for 8 hours)
+
 ## File Structure
 
 ```
