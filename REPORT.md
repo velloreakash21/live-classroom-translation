@@ -7,25 +7,103 @@
 
 ## Architecture
 
+### High-Level System Overview
+
 ```
-Browser Mic → WebRTC (stereo s16 48kHz)
-                  ↓
-         audio_frame_callback (~50x/sec, <1ms)
-                  ↓
-         PCM buffer (3s, mono, energy-based VAD)
-                  ↓
-         ┌─── Background Thread ───────────────────┐
-         │  Groq Whisper STT (whisper-large-v3-turbo) │
-         │           ↓                              │
-         │  Groq LLM Translation (llama-3.3-70b)   │
-         │           ↓                              │
-         │  edge-tts Neural Voice (MP3 synthesis)   │
-         └──────────────────────────────────────────┘
-                  ↓
-         PCM frames → output_queue → WebRTC → Headphones
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              BROWSER (Chrome)                               │
+│                                                                             │
+│  ┌──────────────┐      ┌─────────────────────┐      ┌──────────────────┐   │
+│  │  Microphone   │─────→│   Streamlit WebRTC   │─────→│   Headphones     │   │
+│  │  (Teacher)    │      │   (aiortc engine)    │      │   (Student)      │   │
+│  └──────────────┘      └──────────┬──────────┘      └──────────────────┘   │
+│                                   │  ↑                                      │
+└───────────────────────────────────┼──┼──────────────────────────────────────┘
+                              WebRTC │  │ WebRTC
+                         audio frames│  │ translated frames
+                                    ↓  │
+┌───────────────────────────────────────────────────────────────────────────┐
+│                        STREAMLIT SERVER (Python)                          │
+│                                                                           │
+│  ┌─────────────────────────────────────────────────────────────────────┐  │
+│  │                    TranslationProcessor                              │  │
+│  │                                                                      │  │
+│  │  ┌──────────────┐    ┌────────────┐    ┌───────────────────────┐    │  │
+│  │  │  recv()       │    │ processing │    │  _pipeline_worker()   │    │  │
+│  │  │  (WebRTC      │───→│   _queue   │───→│  (Background Daemon   │    │  │
+│  │  │   thread,     │    │ (maxsize=3)│    │   Thread)             │    │  │
+│  │  │   ~50x/sec)   │    └────────────┘    │                       │    │  │
+│  │  │               │                      │   ┌───────────────┐   │    │  │
+│  │  │  • Stereo→Mono│                      │   │  1. Groq STT  │   │    │  │
+│  │  │  • PCM Buffer │                      │   │  (Whisper)    │   │    │  │
+│  │  │  • Energy VAD │                      │   └──────┬────────┘   │    │  │
+│  │  │  • Silence det│                      │          ↓            │    │  │
+│  │  │               │    ┌────────────┐    │   ┌───────────────┐   │    │  │
+│  │  │               │←───│  output    │←───│   │  2. Groq LLM  │   │    │  │
+│  │  │  Returns:     │    │   _queue   │    │   │  (Llama 3.3)  │   │    │  │
+│  │  │  • Translated │    │(maxsize=500│    │   └──────┬────────┘   │    │  │
+│  │  │    frame OR   │    └────────────┘    │          ↓            │    │  │
+│  │  │  • Silence    │                      │   ┌───────────────┐   │    │  │
+│  │  │    frame      │                      │   │  3. edge-tts  │   │    │  │
+│  │  └──────────────┘                      │   │  (Neural TTS)  │   │    │  │
+│  │                                         │   └───────────────┘   │    │  │
+│  │                                         └───────────────────────┘    │  │
+│  └─────────────────────────────────────────────────────────────────────┘  │
+│                                                                           │
+│  ┌───────────────────────┐  ┌───────────────────────────────────────┐     │
+│  │  Streamlit UI          │  │  Session State                        │     │
+│  │  • Language selector   │  │  • processor instance                 │     │
+│  │  • Voice gender toggle │  │  • transcript log                     │     │
+│  │  • API key input       │  │  • language/voice config              │     │
+│  │  • Live transcript log │  │  • WebRTC context                     │     │
+│  └───────────────────────┘  └───────────────────────────────────────┘     │
+└───────────────────────────────────────────────────────────────────────────┘
+                    │                          │                    │
+                    ↓                          ↓                    ↓
+          ┌─────────────────┐    ┌──────────────────┐    ┌──────────────────┐
+          │  Groq Cloud API  │    │  Groq Cloud API   │    │  Microsoft Edge  │
+          │  ─────────────── │    │  ──────────────── │    │  TTS (CDN)       │
+          │  Whisper Large   │    │  Llama 3.3 70B    │    │  ──────────────  │
+          │  v3 Turbo        │    │  Versatile        │    │  Neural Voices   │
+          │                  │    │                    │    │  (9 Indian langs)│
+          │  Input: WAV bytes│    │  Input: English    │    │  Input: Text     │
+          │  Output: English │    │  Output: Translated│    │  Output: MP3     │
+          │         text     │    │          text      │    │         audio    │
+          └─────────────────┘    └──────────────────┘    └──────────────────┘
 ```
 
 ### Threading Model
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                                                                   │
+│   WebRTC Media Thread              Background Daemon Thread       │
+│   ───────────────────              ─────────────────────────      │
+│                                                                   │
+│   recv() called ~50x/sec           _pipeline_worker() loop:       │
+│         │                                  │                      │
+│         ├─ Append frame to buffer          ├─ Wait on proc_queue  │
+│         │                                  │                      │
+│         ├─ Check energy (VAD)              ├─ transcribe(wav)     │
+│         │   if RMS > 500:                  │   → Groq Whisper API │
+│         │     mark as speech               │   → ~0.45s           │
+│         │                                  │                      │
+│         ├─ If 3s buffer full OR            ├─ translate(text)     │
+│         │   silence after speech:          │   → Groq LLM API    │
+│         │     → put on proc_queue          │   → ~0.30s           │
+│         │                                  │                      │
+│         ├─ Check output_queue              ├─ synthesize(text)    │
+│         │   → return translated frame      │   → edge-tts async  │
+│         │   OR return silence frame        │   → ~1.10s           │
+│         │                                  │                      │
+│         └─ MUST return in <1ms             ├─ Convert MP3→PCM    │
+│            (never blocks, never            │   → 960-sample frames│
+│             makes API calls)               │                      │
+│                                            └─ Put frames on       │
+│                                               output_queue        │
+│                                                                   │
+└─────────────────────────────────────────────────────────────────┘
+```
 
 - `recv()` runs on the WebRTC media thread ~50x/sec. Returns in <1ms. Never blocks, never makes API calls.
 - A single **background daemon thread** runs the slow pipeline (STT → Translate → TTS).
@@ -36,18 +114,115 @@ Browser Mic → WebRTC (stereo s16 48kHz)
 ### Audio Format Flow
 
 ```
-Mic → av.AudioFrame (s16, stereo, 48kHz)
-  → stereo-to-mono conversion (average L+R channels)
-  → numpy int16 buffer (3s at 48kHz = 144,000 samples)
-  → WAV bytes (for Groq Whisper API)
-  → English text
-  → Translated text (Groq Llama 3.3)
-  → MP3 bytes (edge-tts)
-  → pydub decode → resample to 48kHz mono s16
-  → chunk into 960-sample frames (20ms each)
-  → mono-to-stereo duplication (match input layout)
-  → av.AudioFrame with pts timestamps
-  → WebRTC output → Headphones
+┌──────────┐   s16, stereo   ┌──────────────┐   mono, int16   ┌────────────┐
+│ Browser  │───  48kHz  ────→│ recv()       │──  numpy arr  ──→│ PCM Buffer │
+│ Mic      │   av.AudioFrame │ stereo→mono  │   (avg L+R)     │ (3s=144K   │
+└──────────┘                 └──────────────┘                  │  samples)  │
+                                                               └─────┬──────┘
+                                                                     │ WAV bytes
+                                                                     ↓
+┌──────────┐   MP3 bytes     ┌──────────────┐   translated    ┌────────────┐
+│ edge-tts │←────────────────│ Groq LLM     │←── English ─────│ Groq       │
+│ Neural   │   synthesis     │ Llama 3.3    │    text         │ Whisper    │
+│ Voice    │                 │ Translation  │                  │ STT        │
+└────┬─────┘                 └──────────────┘                  └────────────┘
+     │ MP3
+     ↓
+┌──────────────┐  960-sample  ┌──────────────┐   stereo s16   ┌────────────┐
+│ pydub decode │── frames ───→│ mono→stereo  │──  48kHz  ────→│ WebRTC     │
+│ resample to  │   (20ms ea.) │ duplication  │   av.AudioFrame│ Output →   │
+│ 48kHz mono   │              │ + pts stamps │                │ Headphones │
+└──────────────┘              └──────────────┘                └────────────┘
+```
+
+### Classroom Deployment Architecture
+
+#### Approach A: Cloud-Based
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                           CLASSROOM                                     │
+│                                                                         │
+│   ┌──────────────┐                                                      │
+│   │   TEACHER     │                                                      │
+│   │  ┌─────────┐ │      WiFi / Internet                                 │
+│   │  │ Lapel   │ │     ┌───────────────┐     ┌───────────────────────┐  │
+│   │  │ Mic     │─┼────→│  Teacher's    │────→│  CLOUD SERVERS        │  │
+│   │  └─────────┘ │     │  Laptop       │     │                       │  │
+│   │              │     │  (Chrome +    │     │  Deepgram (STT)       │  │
+│   │              │     │   Streamlit)  │←────│  Groq (Translation)   │  │
+│   └──────────────┘     └───────────────┘     │  Azure TTS (Voices)   │  │
+│                              │               └───────────────────────┘  │
+│                              │ Translated audio                         │
+│                              │ (per language)                           │
+│                              ↓                                          │
+│   ┌──────────────────────────────────────────────────────────────────┐  │
+│   │  AUDIO DISTRIBUTION (choose one)                                  │  │
+│   │                                                                    │  │
+│   │  Option 1: BYOD         Option 2: FM           Option 3: ESP32    │  │
+│   │  ┌──────────────┐      ┌──────────────┐      ┌──────────────┐    │  │
+│   │  │📱 Student's  │      │📻 FM Trans-  │      │🔲 ESP32 WiFi │    │  │
+│   │  │   Phone      │      │   mitters    │      │   Receiver   │    │  │
+│   │  │   (WebSocket)│      │   (1/lang)   │      │   + OLED     │    │  │
+│   │  │              │      │              │      │   + DAC      │    │  │
+│   │  │  Select lang │      │  CH1=Hindi   │      │  Scroll to   │    │  │
+│   │  │  on screen   │      │  CH2=Bengali │      │  select lang │    │  │
+│   │  │  + earphones │      │  CH3=Kannada │      │  + earphones │    │  │
+│   │  └──────────────┘      │  ...         │      └──────────────┘    │  │
+│   │  Cost: ~₹150/student   │              │      Cost: ~₹1,600/unit  │  │
+│   │                        │  FM Receiver │                           │  │
+│   │                        │  per student │                           │  │
+│   │                        │  (pre-tuned) │                           │  │
+│   │                        └──────────────┘                           │  │
+│   │                        Cost: ~₹1,200/unit                         │  │
+│   └──────────────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Approach B: Edge (NVIDIA Jetson — Fully Offline)
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                           CLASSROOM                                     │
+│                                                                         │
+│   ┌──────────────┐     USB/WiFi     ┌────────────────────────────────┐  │
+│   │   TEACHER     │                  │  NVIDIA JETSON ORIN NANO SUPER │  │
+│   │  ┌─────────┐ │                  │  (67 TOPS, 8GB RAM)            │  │
+│   │  │ Lapel   │─┼─────────────────→│                                │  │
+│   │  │ Mic     │ │  audio stream    │  ┌────────────────────────┐    │  │
+│   │  └─────────┘ │                  │  │ Whisper Small (TensorRT)│    │  │
+│   │              │                  │  │ STT → ~0.3s             │    │  │
+│   └──────────────┘                  │  └───────────┬────────────┘    │  │
+│                                     │              ↓                  │  │
+│                                     │  ┌────────────────────────┐    │  │
+│                                     │  │ NLLB-200 (600M params) │    │  │
+│                                     │  │ Translation → ~0.2s    │    │  │
+│                                     │  └───────────┬────────────┘    │  │
+│                                     │              ↓                  │  │
+│                                     │  ┌────────────────────────┐    │  │
+│                                     │  │ AI4Bharat Indic-TTS    │    │  │
+│                                     │  │ (VITS) → ~0.3s         │    │  │
+│                                     │  └───────────┬────────────┘    │  │
+│                                     │              │                  │  │
+│                                     │  All models run locally on GPU │  │
+│                                     │  No internet required          │  │
+│                                     │  Total latency: ~2.3s          │  │
+│                                     └───────────────┬────────────────┘  │
+│                                                     │                   │
+│                              Translated audio       │                   │
+│                              (per language)         ↓                   │
+│                                           ┌──────────────────┐          │
+│                                           │  WiFi Router     │          │
+│                                           │  (Local network) │          │
+│                                           └────────┬─────────┘          │
+│                              ┌──────────┬──────────┼──────────┐         │
+│                              ↓          ↓          ↓          ↓         │
+│                          ┌──────┐  ┌──────┐  ┌──────┐  ┌──────┐        │
+│                          │📱/🔲 │  │📱/🔲 │  │📱/🔲 │  │📱/🔲 │        │
+│                          │Hindi │  │Bengali│  │Kannada│  │Tamil │        │
+│                          └──────┘  └──────┘  └──────┘  └──────┘        │
+│                            Students (phones, FM, or ESP32 receivers)    │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -128,6 +303,8 @@ All languages support both male and female neural voices via Microsoft edge-tts.
 
 ## Cost Analysis
 
+> **Note:** All INR prices are estimated at ~₹85/USD as of Feb 2026. Actual prices may vary based on exchange rates and vendor pricing changes.
+
 ### Per-API Pricing (Groq, as of Feb 2026)
 
 | Service                                        | Unit Price               |
@@ -155,12 +332,12 @@ Assumptions:
 
 | Duration                  | Estimated Cost |
 |---------------------------|----------------|
-| **1 minute**              | $0.002         |
-| **1 hour**                | $0.10          |
-| **8-hour day**            | $0.81          |
-| **30-day month** (8h/day) | $24.24        |
+| **1 minute**              | ~₹0.15         |
+| **1 hour**                | ~₹8.50         |
+| **8-hour day**            | ~₹69           |
+| **30-day month** (8h/day) | ~₹2,060        |
 
-> A full classroom day (8 hours) of continuous live translation costs under $1.
+> A full classroom day (8 hours) of continuous live translation costs under ₹70.
 
 ---
 
@@ -232,10 +409,10 @@ Streaming the LLM response allows the TTS stage to begin as soon as the first se
 
 | Configuration | End-to-End Latency | Latency Reduction | Cost / Hour | Cost / 8hr Day | Cost / Month (8h/day) |
 |---------------|-------------------|-------------------|-------------|----------------|----------------------|
-| **Current (POC)** | **~5.0s** | — | $0.10 | $0.81 | $24.24 |
-| **Tier 1:** Streaming STT | **~1.7s** | 66% faster | $0.15 | $1.20 | $36.00 |
-| **Tier 2:** + Streaming TTS | **~0.85s** | 83% faster | $0.50 | $4.00 | $120.00 |
-| **Tier 3:** Full streaming | **~0.5s** | 90% faster | $1.50 | $12.00 | $360.00 |
+| **Current (POC)** | **~5.0s** | — | ~₹8.50 | ~₹69 | ~₹2,060 |
+| **Tier 1:** Streaming STT | **~1.7s** | 66% faster | ~₹13 | ~₹100 | ~₹3,060 |
+| **Tier 2:** + Streaming TTS | **~0.85s** | 83% faster | ~₹42 | ~₹340 | ~₹10,200 |
+| **Tier 3:** Full streaming | **~0.5s** | 90% faster | ~₹128 | ~₹1,020 | ~₹30,600 |
 
 #### Per-Stage Latency Breakdown
 
@@ -248,55 +425,55 @@ Streaming the LLM response allows the TTS stage to begin as soon as the first se
 | Overhead | 0.15s | 0s | 0.15s | 0s |
 | **Total** | **~5.0s** | **~1.7s** | **~0.85s** | **~0.5s** |
 
-#### Tier 1 — Detailed Cost Breakdown ($0.15/hr)
+#### Tier 1 — Detailed Cost Breakdown (~₹13/hr)
 
 Replace batch Groq Whisper with streaming Deepgram Nova-2. Eliminates the 3s buffer.
 
 | Component | Service | Cost / Hour |
 |-----------|---------|-------------|
-| STT | Deepgram Nova-2 (streaming) | $0.035 |
-| Translation | Groq Llama 3.3 (batch) | $0.061 |
-| TTS | edge-tts (free) | $0.000 |
-| **Total** | | **$0.096 → ~$0.15** |
+| STT | Deepgram Nova-2 (streaming) | ~₹3.00 |
+| Translation | Groq Llama 3.3 (batch) | ~₹5.20 |
+| TTS | edge-tts (free) | ₹0 |
+| **Total** | | **~₹8 → ~₹13** |
 
 *What changes:* Replace `transcribe()` with Deepgram WebSocket; remove PCM buffer; let Deepgram handle VAD/endpointing.
 *Effort:* Minimal — swap one API, remove buffer logic.
 
-#### Tier 2 — Detailed Cost Breakdown ($0.50/hr)
+#### Tier 2 — Detailed Cost Breakdown (~₹42/hr)
 
 Add Azure Neural TTS streaming and Groq streaming translation.
 
 | Component | Service | Cost / Hour |
 |-----------|---------|-------------|
-| STT | Deepgram Nova-2 (streaming) | $0.035 |
-| Translation | Groq Llama 3.3 (streaming tokens) | $0.061 |
-| TTS | Azure Neural TTS (WebSocket) | $0.384 |
-| **Total** | | **~$0.50** |
+| STT | Deepgram Nova-2 (streaming) | ~₹3.00 |
+| Translation | Groq Llama 3.3 (streaming tokens) | ~₹5.20 |
+| TTS | Azure Neural TTS (WebSocket) | ~₹32.60 |
+| **Total** | | **~₹42** |
 
-*TTS cost calculation:* ~150 words/min spoken → ~600 chars/min translated → 36,000 chars/hr × $16/1M chars = $0.384/hr.
+*TTS cost calculation:* ~150 words/min spoken → ~600 chars/min translated → 36,000 chars/hr × ₹1,360/1M chars = ~₹32.60/hr.
 *What changes:* Add Azure TTS WebSocket connection; stream Groq response tokens; begin TTS as first sentence completes.
 *Effort:* Moderate — new TTS integration, async pipeline restructuring.
 
-#### Tier 3 — Detailed Cost Breakdown ($1.50/hr)
+#### Tier 3 — Detailed Cost Breakdown (~₹128/hr)
 
 All services streaming via persistent WebSockets. Overlapping pipeline stages.
 
 | Component | Service | Cost / Hour |
 |-----------|---------|-------------|
-| STT | Deepgram Nova-2 (streaming) | $0.035 |
-| Translation | Cerebras Inference (streaming) | $0.065 |
-| TTS | Cartesia Sonic (streaming) | $1.400 |
-| **Total** | | **~$1.50** |
+| STT | Deepgram Nova-2 (streaming) | ~₹3.00 |
+| Translation | Cerebras Inference (streaming) | ~₹5.50 |
+| TTS | Cartesia Sonic (streaming) | ~₹119 |
+| **Total** | | **~₹128** |
 
-*TTS cost calculation:* ~36,000 chars/hr × $0.042/1K chars = $1.40/hr (Cartesia is premium but ultra-low latency at ~90ms).
-*Alternative:* ElevenLabs Turbo at $0.30/1K chars = $10.80/hr (higher quality but significantly more expensive).
+*TTS cost calculation:* ~36,000 chars/hr × ₹3.57/1K chars = ~₹119/hr (Cartesia is premium but ultra-low latency at ~90ms).
+*Alternative:* ElevenLabs Turbo at ₹25.50/1K chars = ~₹918/hr (higher quality but significantly more expensive).
 *What changes:* Full async WebSocket pipeline; all stages run concurrently; sentence boundary detection between STT and translation.
 *Effort:* Full rewrite — new architecture, all new service integrations.
 
 #### Cost vs. Latency Trade-off
 
 ```
-Cost/hr:  $0.10 ──── $0.15 ──────────── $0.50 ──────────── $1.50
+Cost/hr:  ₹8.50 ──── ₹13 ──────────── ₹42 ──────────── ₹128
              │          │                   │                   │
 Latency:   5.0s ──── 1.7s ──────────── 0.85s ──────────── 0.5s
              │          │                   │                   │
@@ -305,8 +482,8 @@ Latency:   5.0s ──── 1.7s ──────────── 0.85s ─
             TTS)      STT only)          STT+TTS)          streaming)
 ```
 
-> **Best value:** Tier 1 delivers a 66% latency reduction (5.0s → 1.7s) for only $0.05/hr more — practically free at $1.20/day.
-> **Best experience:** Tier 2 achieves sub-second latency at $4/day — suitable for production classroom use.
+> **Best value:** Tier 1 delivers a 66% latency reduction (5.0s → 1.7s) for only ~₹4.50/hr more — practically free at ~₹100/day.
+> **Best experience:** Tier 2 achieves sub-second latency at ~₹340/day — suitable for production classroom use.
 
 ### Architecture Change: Batch → Streaming
 
@@ -335,17 +512,17 @@ Key implementation changes required:
 
 ### Recommended Upgrade Path
 
-**Phase 1 — Quick win (5.0s → 1.7s, +$0.05/hr):**
+**Phase 1 — Quick win (5.0s → 1.7s, +~₹4.50/hr):**
 - Replace Groq Whisper batch calls with **Deepgram Nova-2 streaming** WebSocket
 - Remove the 3s PCM buffer; let Deepgram handle endpointing/VAD
 - Keep Groq translation and edge-tts unchanged
 
-**Phase 2 — Sub-second (1.7s → 0.85s, +$0.35/hr):**
+**Phase 2 — Sub-second (1.7s → 0.85s, +~₹29/hr):**
 - Add **Azure Neural TTS** via WebSocket (streaming playback)
 - Enable **Groq streaming** response for translation
 - Begin TTS synthesis as soon as first translated sentence is available
 
-**Phase 3 — Near real-time (0.85s → 0.5s, +$1.00/hr):**
+**Phase 3 — Near real-time (0.85s → 0.5s, +~₹86/hr):**
 - All services connected via persistent WebSockets
 - **Deepgram** streaming STT + **Cerebras** streaming translation + **Cartesia Sonic** streaming TTS
 - Fully async pipeline with overlapping stages
@@ -367,6 +544,307 @@ Deployed on **Streamlit Community Cloud** at [live-classroom-translation-india.s
 ### Python 3.13 Compatibility
 
 Streamlit Cloud runs Python 3.13, which removed the `audioop` stdlib module. The `pydub` library depends on `audioop` for audio processing. Resolution: added `audioop-lts` (community backport) to requirements.
+
+---
+
+## Classroom Deployment Plan
+
+This section covers end-to-end physical deployment in a real classroom — hardware, audio distribution to students, language selection UI, and two architectural approaches: **cloud-based** and **edge/on-premise**.
+
+> **Note:** All prices are estimated as of Feb 2026 and converted at ~₹85/USD. Actual prices may vary based on vendor, quantity, location, and market conditions. Always verify current pricing before procurement.
+
+### System Overview
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                        CLASSROOM                            │
+│                                                             │
+│   ┌──────────┐     ┌──────────────┐     ┌──────────────┐   │
+│   │ Teacher   │────→│ Server       │────→│ Students     │   │
+│   │ (Mic +    │     │ (Cloud or    │     │ (Receivers + │   │
+│   │  Laptop)  │     │  Jetson)     │     │  Earphones)  │   │
+│   └──────────┘     └──────────────┘     └──────────────┘   │
+│                           │                    │            │
+│                     ┌─────┴─────┐        ┌─────┴─────┐     │
+│                     │ STT →     │        │ WiFi / FM │     │
+│                     │ Translate │        │ per-lang  │     │
+│                     │ → TTS     │        │ channels  │     │
+│                     └───────────┘        └───────────┘     │
+└─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### Approach A: Cloud-Based Deployment
+
+The teacher's laptop captures audio, sends it to cloud APIs for processing, and streams translated audio to students over the local network or FM.
+
+#### A1. Teacher Setup
+
+| Item | Specification | Est. Cost |
+|------|--------------|-----------|
+| Laptop/Tablet | Any modern laptop running Chrome | Existing |
+| Wireless lapel mic | Rode Wireless GO II or similar | ~₹15,000 |
+| Internet connection | Min 5 Mbps upload (for API calls) | Existing |
+
+The teacher opens the web app, clips on the lapel mic, and speaks naturally. No training required.
+
+#### A2. Audio Distribution to Students
+
+Three options for getting translated audio to each student:
+
+**Option 1: Smartphones (BYOD) — Cheapest**
+
+Students open a web URL on their phone, select their language, and listen through their own earphones.
+
+| Item | Details | Cost per Student |
+|------|---------|-----------------|
+| Student's smartphone | BYOD (bring your own device) | ₹0 |
+| Earphones/earbuds | Basic wired earbuds | ~₹150 |
+| WiFi router | Classroom WiFi for all students | ~₹4,000 (one-time) |
+
+*Architecture:* Server generates separate audio streams per language. Students connect via WebSocket and receive their selected language's audio in real-time.
+
+*Pros:* Near-zero hardware cost. Easy language selection via UI on phone.
+*Cons:* Requires each student to have a smartphone. Battery drain. Potential WiFi congestion with 30+ devices.
+
+**Option 2: FM Radio Receivers — Most Reliable**
+
+Each language is broadcast on a separate FM frequency. Students wear small FM receivers tuned to their language.
+
+| Item | Details | Cost per Student |
+|------|---------|-----------------|
+| FM transmitter (multi-channel) | Retekess T130S or similar, 1 per language | ~₹2,500 each |
+| FM receivers + earbuds | Retekess T130 receiver | ~₹1,200 each |
+| Charging case (64-slot) | Retekess charging dock | ~₹12,000 (one-time) |
+
+*Architecture:* Server outputs translated audio per language → each language feeds a separate FM transmitter → students wear receivers pre-tuned to their language's frequency.
+
+| FM Channel | Language | Frequency |
+|------------|----------|-----------|
+| CH1 | Hindi | 87.5 MHz |
+| CH2 | Bengali | 88.0 MHz |
+| CH3 | Kannada | 88.5 MHz |
+| CH4 | Tamil | 89.0 MHz |
+| ... | ... | ... |
+
+*Pros:* Extremely reliable. No WiFi needed. Works with 100+ students. Students just pick up a receiver — no phone needed.
+*Cons:* Higher upfront cost. Language selection = picking the right receiver/channel. Students can't easily switch languages.
+
+**Option 3: ESP32 WiFi Receivers — Custom Hardware, Best UX**
+
+Custom-built WiFi audio receivers using ESP32 microcontrollers with a small OLED screen for language selection and a 3.5mm headphone jack.
+
+| Item | Details | Cost per Unit |
+|------|---------|--------------|
+| ESP32-S3 module | WiFi + Bluetooth, I2S audio out | ~₹400 |
+| PCM5102A I2S DAC | High-quality audio output | ~₹250 |
+| 0.96" OLED display | Language selection menu | ~₹250 |
+| 3D-printed case | Compact enclosure | ~₹150 |
+| LiPo battery (500mAh) | ~8hr runtime | ~₹250 |
+| Assembly + PCB | Per-unit manufacturing | ~₹300 |
+| **Total per unit** | | **~₹1,600** |
+
+*Architecture:* ESP32 connects to classroom WiFi → subscribes to a language-specific audio stream via WebSocket → decodes and plays through DAC → headphone jack.
+
+*Student UX:* Power on → scroll OLED to select language → plug in earphones → listen.
+
+*Pros:* Beautiful custom UX. Students scroll to select language on device. No smartphone needed. Rechargeable.
+*Cons:* Requires custom hardware development. Lead time for manufacturing.
+
+#### A3. Cloud Infrastructure Cost (per classroom, per month)
+
+Assuming Tier 2 streaming pipeline, 6 hours/day, 22 days/month:
+
+| Component | Cost / Month |
+|-----------|-------------|
+| Cloud APIs (Tier 2: Deepgram + Groq + Azure TTS) | ~₹5,600 |
+| Streamlit Cloud hosting | Free |
+| Internet (school WiFi) | Existing |
+| **Total recurring** | **~₹5,600 / month** |
+
+#### A4. Cloud Setup — Total One-Time Costs
+
+| Classroom Size | Distribution Method | Hardware Cost | Recurring/Month |
+|---------------|-------------------|--------------|----------------|
+| 30 students | Smartphones (BYOD) | ~₹8,500 (router + earbuds) | ~₹5,600 |
+| 30 students | FM receivers | ~₹63,500 (transmitters + receivers + charger) | ~₹5,600 |
+| 30 students | ESP32 custom devices | ~₹52,000 (30 units + router) | ~₹5,600 |
+| 60 students | FM receivers | ~₹1,15,000 | ~₹5,600 |
+| 60 students | ESP32 custom devices | ~₹1,00,000 | ~₹5,600 |
+
+---
+
+### Approach B: Edge Deployment (NVIDIA Jetson — Zero Recurring Cost)
+
+Run the entire pipeline locally on an NVIDIA Jetson device. No internet required after setup. Zero API costs.
+
+#### B1. Hardware Stack
+
+| Item | Specification | Est. Cost |
+|------|--------------|-----------|
+| **NVIDIA Jetson Orin Nano Super** | 67 TOPS, 8GB RAM, GPU-accelerated AI | ~₹33,000 |
+| NVMe SSD (256GB) | For models + OS | ~₹2,500 |
+| Power supply | 15W USB-C | Included |
+| Wireless lapel mic | Rode Wireless GO II | ~₹15,000 |
+| WiFi router (for student devices) | Dual-band, 50+ clients | ~₹4,000 |
+| **Total server hardware** | | **~₹55,000** |
+
+#### B2. On-Device AI Models
+
+| Pipeline Stage | Model | Size | Jetson Performance |
+|---------------|-------|------|--------------------|
+| **STT** | Whisper Small (TensorRT) | 461MB | ~0.3s for 3s audio (3x faster via whisper_trt) |
+| **STT (better)** | Whisper Medium (TensorRT) | 1.5GB | ~0.8s for 3s audio |
+| **Translation** | NLLB-200 (Meta, distilled 600M) | 1.2GB | ~0.2s per sentence |
+| **Translation (alt)** | IndicTrans2 (AI4Bharat, 1.1B) | 2.2GB | ~0.4s per sentence |
+| **TTS** | AI4Bharat Indic-TTS (VITS) | ~200MB | ~0.3s per sentence |
+| **TTS (alt)** | Piper TTS + Indic voices | ~100MB | ~0.1s per sentence |
+
+All models fit in 8GB RAM. Total model footprint: ~2-4GB depending on configuration.
+
+**Key projects for Jetson deployment:**
+- [whisper_trt](https://github.com/NVIDIA-AI-IOT/whisper_trt) — NVIDIA's official Whisper TensorRT optimization (3x faster, 60% less memory)
+- [AI4Bharat Indic-TTS](https://github.com/AI4Bharat/Indic-TTS) — Open-source TTS for 13 Indian languages
+- [Indic Parler-TTS](https://huggingface.co/ai4bharat/indic-parler-tts) — Next-gen Indic TTS supporting 21 languages (Apache 2.0 license)
+
+#### B3. Edge Pipeline Latency (Estimated)
+
+| Stage | Cloud (Tier 2) | Jetson Orin Nano |
+|-------|---------------|-----------------|
+| Buffer/VAD | 0s (streaming) | 1.5s (reduced buffer) |
+| STT | 0.30s | 0.30s (Whisper Small TRT) |
+| Translation | 0.15s | 0.20s (NLLB-200) |
+| TTS | 0.25s | 0.30s (Indic-TTS) |
+| **Total** | **~0.85s** | **~2.3s** |
+
+The Jetson is slower than cloud streaming APIs but has **zero recurring cost** and **no internet dependency**.
+
+#### B4. Edge Setup — Total Costs
+
+| Classroom Size | Distribution Method | One-Time Hardware | Recurring/Month |
+|---------------|-------------------|------------------|----------------|
+| 30 students | Smartphones (BYOD) | ~₹59,500 (Jetson + router + earbuds) | **₹0** |
+| 30 students | FM receivers | ~₹1,08,500 (Jetson + FM system) | **₹0** |
+| 30 students | ESP32 custom devices | ~₹1,03,000 (Jetson + ESP32s + router) | **₹0** |
+| 60 students | FM receivers | ~₹1,60,000 | **₹0** |
+| 60 students | ESP32 custom devices | ~₹1,51,000 | **₹0** |
+
+---
+
+### Cloud vs. Edge — Full Comparison
+
+| Factor | Cloud (Approach A) | Edge / Jetson (Approach B) |
+|--------|-------------------|---------------------------|
+| **Latency (best)** | ~0.85s (Tier 2) | ~2.3s |
+| **Latency (POC)** | ~5.0s | ~3.5s |
+| **Recurring cost** | ₹5,600/month (Tier 2) | **₹0** |
+| **Upfront cost (30 students, FM)** | ~₹63,500 | ~₹1,08,500 |
+| **Break-even point** | — | ~8 months |
+| **Internet required** | Yes (5 Mbps+) | **No** |
+| **Voice quality** | Excellent (neural voices) | Good (open-source VITS) |
+| **Languages** | 9 (expandable) | 13-21 (AI4Bharat models) |
+| **Maintenance** | Zero (cloud-managed) | Occasional model updates |
+| **Reliability** | Depends on internet | Fully offline, always works |
+| **Scalability** | Unlimited classrooms | 1 Jetson per classroom |
+| **Privacy** | Audio sent to cloud APIs | **All data stays local** |
+
+#### Cost Projection Over Time (30 students, FM receivers)
+
+| Duration | Cloud (Approach A) | Edge (Approach B) |
+|----------|-------------------|-------------------|
+| Setup (month 0) | ₹63,500 | ₹1,08,500 |
+| After 6 months | ₹97,100 | ₹1,08,500 |
+| **After 8 months** | **₹1,08,300** | **₹1,08,500** ← Break-even |
+| After 1 year | ₹1,30,700 | ₹1,08,500 |
+| After 2 years | ₹1,97,900 | ₹1,08,500 |
+| After 3 years | ₹2,65,100 | ₹1,08,500 |
+
+> **Verdict:** Edge pays for itself in ~8 months and saves ₹50,000+/year thereafter. Cloud is better for pilot/short-term. Edge wins for permanent installations.
+
+---
+
+### Student Language Selection UI
+
+Regardless of cloud or edge, students need a way to select their language.
+
+**For smartphone (BYOD) approach:**
+
+A clean, mobile-first web UI served from the translation server:
+
+```
+┌─────────────────────────────┐
+│   🎓 Classroom Translation  │
+│                             │
+│   Select your language:     │
+│                             │
+│   ┌───────────────────────┐ │
+│   │  🇮🇳  Hindi           │ │
+│   ├───────────────────────┤ │
+│   │  🇮🇳  Bengali         │ │
+│   ├───────────────────────┤ │
+│   │  🇮🇳  Kannada         │ │
+│   ├───────────────────────┤ │
+│   │  🇮🇳  Tamil           │ │
+│   ├───────────────────────┤ │
+│   │  🇮🇳  Telugu          │ │
+│   └───────────────────────┘ │
+│                             │
+│   Scan QR code to connect:  │
+│   ┌─────────┐              │
+│   │ QR CODE │              │
+│   └─────────┘              │
+└─────────────────────────────┘
+```
+
+- Teacher's screen displays a **QR code** with the classroom URL
+- Students scan with phone camera → opens web app
+- One-tap language selection → audio streams immediately
+- No app install required — pure web (PWA)
+
+**For FM receiver approach:**
+
+- Receivers come pre-labeled: "CH1 = Hindi", "CH2 = Bengali", etc.
+- Color-coded stickers on each receiver
+- Poster on classroom wall with channel-language mapping
+
+**For ESP32 custom device approach:**
+
+- Power on → OLED shows language list
+- Scroll with side button → press to select
+- LED indicator shows connected status
+- Auto-reconnects to classroom WiFi
+
+---
+
+### Recommended Deployment Configurations
+
+**For a pilot program (1-2 classrooms, 3-6 months):**
+→ **Cloud + Smartphones (BYOD)**
+- Cheapest to start: ~₹8,500 setup + ~₹5,600/month
+- Validates the concept before investing in hardware
+- Easy to iterate on software
+
+**For a permanent school installation (cost-sensitive):**
+→ **Edge (Jetson) + FM receivers**
+- One-time cost: ~₹1,08,500 per classroom
+- Zero recurring costs, no internet needed
+- Most reliable for rural/low-connectivity schools
+- Break-even vs. cloud in 8 months
+
+**For a premium school installation (best experience):**
+→ **Cloud (Tier 2) + ESP32 custom devices**
+- One-time: ~₹1,03,000 per classroom + ₹5,600/month
+- Sub-second latency, excellent voice quality
+- Beautiful student UX with OLED language selector
+- Easy to add more languages remotely
+
+**For a large-scale district deployment (100+ classrooms):**
+→ **Edge (Jetson) + ESP32 custom devices, bulk manufactured**
+- Per-classroom cost drops to ~₹68,000 at scale (bulk ESP32 + Jetson pricing)
+- Zero recurring cost across all classrooms = massive savings
+- Central management dashboard for model updates over school network
+- Total for 100 classrooms: ~₹68,00,000 one-time vs. ₹67,20,000/year cloud
 
 ---
 
